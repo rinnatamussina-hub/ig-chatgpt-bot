@@ -2,28 +2,20 @@
 import os
 import hmac
 import hashlib
-import json
 import time
-from flask import Flask, request, jsonify, abort
+from flask import Flask, request, abort
 import requests
 
-# ---------- Config ----------
 GRAPH_API_VERSION = os.getenv("GRAPH_API_VERSION", "v21.0")
-PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")  # Page token connected to IG Professional account
+PAGE_ACCESS_TOKEN = os.getenv("PAGE_ACCESS_TOKEN")
 VERIFY_TOKEN = os.getenv("VERIFY_TOKEN", "verify_me")
-APP_SECRET = os.getenv("APP_SECRET", "")  # Optional: for signature verification
+APP_SECRET = os.getenv("APP_SECRET", "")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-SALON_NAME = os.getenv("SALON_NAME", "Yelena Heal Aura Studio")
-BOOKING_LINK = os.getenv("BOOKING_LINK", "https://dikidi.net/946726?p=0.pi-po")
-DEFAULT_LANGS = os.getenv("DEFAULT_LANGS", "detect")  # "detect" or "tr+ru"
-TIMEOUT_SECS = float(os.getenv("TIMEOUT_SECS", "16"))
 
 app = Flask(__name__)
 
-# ---------- Helpers ----------
 def verify_signature(req):
-    """Verify X-Hub-Signature-256 from Meta (optional but recommended)."""
     if not APP_SECRET:
         return True
     signature = req.headers.get("X-Hub-Signature-256", "")
@@ -33,7 +25,6 @@ def verify_signature(req):
     return hmac.compare_digest(signature.split("=", 1)[1], digest)
 
 def send_ig_text(recipient_id: str, text: str):
-    """Send a text reply to an Instagram user via Messenger Send API (for IG DM)."""
     url = f"https://graph.facebook.com/{GRAPH_API_VERSION}/me/messages"
     payload = {
         "recipient": {"id": recipient_id},
@@ -42,12 +33,9 @@ def send_ig_text(recipient_id: str, text: str):
     }
     params = {"access_token": PAGE_ACCESS_TOKEN}
     resp = requests.post(url, params=params, json=payload, timeout=10)
-    if not resp.ok:
-        app.logger.error("Meta send error %s %s", resp.status_code, resp.text)
     return resp.ok
 
 def detect_lang(text: str) -> str:
-    """Very light heuristic: if Cyrillic -> ru, if Turkish chars -> tr, else fallback."""
     cyr = any("а" <= ch <= "я" or "А" <= ch <= "Я" for ch in text)
     tur = any(ch in "ığüşöçĞÜŞİÖÇ" for ch in text)
     if cyr and not tur:
@@ -58,15 +46,25 @@ def detect_lang(text: str) -> str:
 
 def build_system_prompt():
     return f"""
-Ты — вежливый, краткий ассистент салона массажа «{SALON_NAME}».
-Правила ответа:
-1) Отвечай дружелюбно и по делу, без лишней воды.
-2) Если вопрос про запись, ВСЕГДА добавляй ссылку на онлайн-запись: {BOOKING_LINK}
-3) Если пользователь пишет на турецком — отвечай на турецком. Если на русском — на русском. Если язык непонятен — ответь сначала по‑турецки, ниже по‑русски.
-4) Форматируй короткими абзацами и эмодзи по ситуации (не больше 2).
-5) Если вопрос не по теме салона или требует человека, отвечай: «Передаю администратору, он скоро напишет».
-6) Никогда не придумывай цены, используй формулировку «güncel fiyatlar ve uygun saatler için linke tıklayın / актуальные цены и свободные окошки по ссылке: {BOOKING_LINK}».
-7) Не запрашивай персональные данные, кроме необходимых для записи (имя, телефон, желаемое время).
+Ты — вежливый и внимательный ассистент салона массажа «Yelena Heal Aura Studio». 
+Отвечай дружелюбно и по делу, без лишней воды. Используй максимум 2 уместных эмодзи.
+
+📌 ОБЩИЕ ПРАВИЛА:
+1) Если вопрос про запись, цены, услуги или отзывы — всегда указывай ссылку:
+   «Смотрите актуальные цены, свободные окошки и отзывы по ссылке 👉 https://dikidi.ru/946726?p=2.pi-po-ssm&o=7»
+2) Если клиент спрашивает про адрес — давай полный адрес + ссылку на Google Maps:
+   «Bağlarbaşı mahallesi Atatürk caddesi Omay pasajı No:56 A blok Daire 50 Maltepe/İstanbul, Turkey
+   👉 https://maps.app.goo.gl/wT6cVGeWgWH2XHeF7»
+3) График работы:
+   «Мы открыты с понедельника по субботу с 10:00 до 20:00».
+4) Язык:
+   - Если клиент пишет на турецком — отвечай на турецком.
+   - Если на русском — отвечай на русском.
+   - Если язык непонятен — ответь сначала по-турецки, ниже по-русски.
+5) Если клиент благодарит — отвечай:
+   «Спасибо вам 🤍 Ждём снова в Yelena Heal Aura Studio».
+6) Если вопрос не связан с салоном, услугами, ценами, адресом, записью или благодарностью — НЕ отвечай вообще.
+7) Никогда не придумывай цены и услуги — отправляй только на ссылку с онлайн-записью.
 """
 
 def call_openai(user_text: str, lang_hint: str) -> str:
@@ -85,22 +83,19 @@ def call_openai(user_text: str, lang_hint: str) -> str:
         "max_tokens": 300
     }
     try:
-        resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=TIMEOUT_SECS)
+        resp = requests.post("https://api.openai.com/v1/chat/completions", headers=headers, json=payload, timeout=16)
         resp.raise_for_status()
         data = resp.json()
         return data["choices"][0]["message"]["content"].strip()
-    except Exception as e:
-        # Fallback generic bilingual reply
-        return f"Merhaba! Sorunuzu aldım. Randevu ve fiyatlar için link: {BOOKING_LINK}\n\nЗдравствуйте! Ваш вопрос получил(а). Записаться и посмотреть цены: {BOOKING_LINK}"
+    except Exception:
+        return ""
 
-# ---------- Routes ----------
 @app.route("/health", methods=["GET"])
 def health():
     return {"ok": True, "time": int(time.time())}
 
 @app.route("/webhook", methods=["GET"])
 def webhook_verify():
-    # Verification handshake
     mode = request.args.get("hub.mode")
     token = request.args.get("hub.verify_token")
     challenge = request.args.get("hub.challenge")
@@ -113,18 +108,17 @@ def webhook_receive():
     if not verify_signature(request):
         abort(403)
     payload = request.get_json(force=True, silent=True) or {}
-    # Instagram + Messenger share the "entry" -> "messaging" shape
     for entry in payload.get("entry", []):
         for event in entry.get("messaging", []):
             sender = event.get("sender", {}).get("id")
             message = event.get("message", {})
             text = message.get("text")
-            # Ignore non-text messages
             if not sender or not text:
                 continue
             lang_hint = detect_lang(text)
             reply = call_openai(text, lang_hint)
-            send_ig_text(sender, reply)
+            if reply.strip():
+                send_ig_text(sender, reply)
     return "OK", 200
 
 if __name__ == "__main__":
